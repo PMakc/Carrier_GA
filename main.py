@@ -707,6 +707,51 @@ class Database:
             conn.execute("DELETE FROM raffle_draws")
             return count
 
+    def reset_career_day(self) -> dict[str, int]:
+        """Clear all event activity while preserving station setup and admins.
+
+        Station names/codes and app settings are configuration created before
+        the event, so they remain in place. All registrations, visits,
+        cooldowns, anti-spam counters and raffle history are removed.
+        Configured ADMIN_IDS are recreated as organizers so an administrator
+        does not lose access after the reset.
+        """
+        admin_ids = sorted(ADMIN_IDS)
+        with self.connect() as conn:
+            counts = {
+                "users": int(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]),
+                "participants": int(conn.execute(
+                    "SELECT COUNT(*) FROM users WHERE user_fio IS NOT NULL"
+                ).fetchone()[0]),
+                "visits": int(conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]),
+                "raffle_draws": int(conn.execute("SELECT COUNT(*) FROM raffle_draws").fetchone()[0]),
+                "cooldowns": int(conn.execute("SELECT COUNT(*) FROM user_cooldown").fetchone()[0]),
+                "spam_records": int(conn.execute("SELECT COUNT(*) FROM spam_protection").fetchone()[0]),
+            }
+
+            conn.execute("DELETE FROM visits")
+            conn.execute("DELETE FROM user_cooldown")
+            conn.execute("DELETE FROM spam_protection")
+            conn.execute("DELETE FROM raffle_draws")
+            conn.execute("DELETE FROM users")
+
+            # Keep the preconfigured administrator accounts working without
+            # requiring them to register or enter the organizer password again.
+            for admin_id in admin_ids:
+                conn.execute(
+                    """INSERT INTO users
+                       (user_id, user_role, role_selected, organizer_access)
+                       VALUES (?, 'organizer', 1, 1)""",
+                    (admin_id,),
+                )
+
+            # Reset activity-table counters only. Never reset station IDs,
+            # because visits and station management rely on their stable IDs.
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('visits', 'raffle_draws')"
+            )
+            return counts
+
     def get_all_stats(self) -> dict[str, int]:
         with self.connect() as conn:
             total_users = int(conn.execute(
@@ -1017,6 +1062,20 @@ class BotHandler:
     def is_admin(self, user_id: int) -> bool:
         return user_id in ADMIN_IDS
 
+    def has_organizer_privileges(self, user_id: int) -> bool:
+        """Return True for configured admins and password-authorized organizers.
+
+        ADMIN_IDS is the permanent admin override. Other users receive the
+        operational organizer permissions only after a successful password
+        check, which is persisted in users.organizer_access.
+        """
+        if self.is_admin(user_id):
+            return True
+        return (
+            self.db.has_organizer_access(user_id)
+            or self.db.get_role(user_id) in ("organizer", "admin")
+        )
+
     def get_role_selection_keyboard(self) -> dict[str, Any]:
         return self.create_keyboard([
             [
@@ -1033,10 +1092,15 @@ class BotHandler:
         ])
 
     def get_organizer_menu(self) -> dict[str, Any]:
+        # Password-authorized organizers can run the event: manage stations,
+        # export the report and reset the raffle. The full event reset remains
+        # restricted to the permanent ADMIN_IDS accounts.
         return self.create_keyboard([
             [("🔑 Коды станций", "primary"), ("📈 Статистика", "primary")],
             [("🏆 Победители", "positive"), ("🎰 Розыгрыш", "positive")],
-            [("📋 Полный отчёт", "secondary"), ("❓ Помощь", "secondary")],
+            [("🛠 Управление станциями", "primary"), ("📊 Excel-отчёт", "positive")],
+            [("♻️ Сбросить розыгрыш", "secondary"), ("📋 Полный отчёт", "secondary")],
+            [("❓ Помощь", "secondary")],
             [("🔄 Сменить роль", "secondary", {"action": "role_switch"})],
         ])
 
@@ -1046,6 +1110,7 @@ class BotHandler:
             [("🏆 Победители", "positive"), ("🎰 Розыгрыш", "positive")],
             [("🛠 Управление станциями", "primary"), ("📊 Excel-отчёт", "positive")],
             [("♻️ Сбросить розыгрыш", "secondary"), ("❓ Помощь", "secondary")],
+            [("🧹 Сбросить День карьеры", "negative", {"action": "career_reset_start"})],
             [("🔄 Сменить роль", "secondary", {"action": "role_switch"})],
         ])
 
@@ -1108,7 +1173,7 @@ class BotHandler:
         elif role == "🏢 Организатор":
             self.user_states.pop(user_id, None)
             self.state_data.pop(user_id, None)
-            if self.db.has_organizer_access(user_id):
+            if self.db.has_organizer_access(user_id) or self.is_admin(user_id):
                 self.db.update_role(user_id, "organizer")
                 self.bot.send_message(
                     user_id,
@@ -1340,7 +1405,8 @@ class BotHandler:
                 "• Управление станциями — добавление, редактирование и отключение станций.\n"
                 "• Excel-отчёт — сводка, участники и подробный журнал посещений.\n"
                 "• Розыгрыш — последовательный выбор победителей без повторов.\n"
-                "• Сбросить розыгрыш — очистить историю выбранных победителей.\n\n"
+                "• Сбросить розыгрыш — очистить историю выбранных победителей.\n"
+                "• Сбросить День карьеры — удалить регистрации и все игровые результаты; станции и коды сохраняются.\n\n"
                 "• Сменить роль — перейти в режим участника без потери прав организатора.\n\n"
                 "Команды: /visit_ID [VK_ID], /complete_all VK_ID, /export."
             )
@@ -1348,8 +1414,10 @@ class BotHandler:
             return (
                 "❓ ПОМОЩЬ ОРГАНИЗАТОРА\n\n"
                 "• Коды станций — список кодовых слов.\n"
+                "• Управление станциями — добавление, редактирование и отключение станций.\n"
+                "• Excel-отчёт — выгрузка сводки и журнала посещений.\n"
                 "• Статистика и победители — результаты мероприятия.\n"
-                "• Розыгрыш — случайный выбор среди прошедших все активные станции.\n\n"
+                "• Розыгрыш и сброс розыгрыша — выбор победителей и очистка истории без повторов.\n\n"
                 "Кнопка «Сменить роль» позволяет переключиться в режим участника.\n"
                 "После первого ввода специального кода повторно вводить его не потребуется.\n\n"
                 "Для отметки участника администратор использует /visit_ID [VK_ID]."
@@ -1366,7 +1434,7 @@ class BotHandler:
 
     # -- Admin station management -----------------------------------------
     def send_station_admin_menu(self, user_id: int) -> None:
-        if not self.is_admin(user_id):
+        if not self.has_organizer_privileges(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         stations = self.db.get_active_stations()
@@ -1423,12 +1491,12 @@ class BotHandler:
         return self.create_keyboard(rows)
 
     def send_station_remove_menu(self, user_id: int, page: int = 0) -> None:
-        if not self.is_admin(user_id):
+        if not self.has_organizer_privileges(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         stations = self.db.get_active_stations()
         if len(stations) <= 1:
-            self.bot.send_message(user_id, "Нельзя удалить последнюю активную станцию.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Нельзя удалить последнюю активную станцию.", self.menu_for(user_id))
             return
         self.bot.send_message(
             user_id,
@@ -1440,12 +1508,12 @@ class BotHandler:
         )
 
     def send_station_edit_menu(self, user_id: int, page: int = 0) -> None:
-        if not self.is_admin(user_id):
+        if not self.has_organizer_privileges(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         stations = self.db.get_active_stations()
         if not stations:
-            self.bot.send_message(user_id, "Нет активных станций для редактирования.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Нет активных станций для редактирования.", self.menu_for(user_id))
             return
         self.bot.send_message(
             user_id,
@@ -1457,12 +1525,12 @@ class BotHandler:
         )
 
     def start_edit_station(self, user_id: int, station_id: int) -> None:
-        if not self.is_admin(user_id):
+        if not self.has_organizer_privileges(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         station = next((s for s in self.db.get_active_stations() if int(s["id"]) == station_id), None)
         if not station:
-            self.bot.send_message(user_id, "Эта станция уже отключена или не найдена.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Эта станция уже отключена или не найдена.", self.menu_for(user_id))
             return
         self.user_states[user_id] = "waiting_station_edit_data"
         self.state_data[user_id] = {"station_id": station_id}
@@ -1478,7 +1546,7 @@ class BotHandler:
         )
 
     def start_add_station(self, user_id: int) -> None:
-        if not self.is_admin(user_id):
+        if not self.has_organizer_privileges(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         self.user_states[user_id] = "waiting_station_data"
@@ -1506,6 +1574,11 @@ class BotHandler:
         return name, code
 
     def add_station_from_text(self, user_id: int, text: str) -> None:
+        if not self.has_organizer_privileges(user_id):
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            self.bot.send_message(user_id, "❌ Недостаточно прав для управления станциями.", self.menu_for(user_id))
+            return
         parsed = self._parse_station_form(text)
         if not parsed:
             self.bot.send_message(
@@ -1531,16 +1604,21 @@ class BotHandler:
             user_id,
             f"✅ Станция добавлена!\n\n📍 {name}\n🔑 Код: {code}\n🆔 ID: {station_id}\n"
             f"Команда ручной отметки: /visit_{station_id}",
-            self.get_admin_menu(),
+            self.menu_for(user_id),
         )
 
     def edit_station_from_text(self, user_id: int, text: str) -> None:
+        if not self.has_organizer_privileges(user_id):
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            self.bot.send_message(user_id, "❌ Недостаточно прав для управления станциями.", self.menu_for(user_id))
+            return
         station_id = int(self.state_data.get(user_id, {}).get("station_id", 0))
         parsed = self._parse_station_form(text)
         if not station_id:
             self.user_states.pop(user_id, None)
             self.state_data.pop(user_id, None)
-            self.bot.send_message(user_id, "Не удалось определить выбранную станцию. Откройте редактирование заново.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Не удалось определить выбранную станцию. Откройте редактирование заново.", self.menu_for(user_id))
             return
         if not parsed:
             self.bot.send_message(
@@ -1567,18 +1645,18 @@ class BotHandler:
                 user_id,
                 f"✅ Станция обновлена!\n\n🆔 ID: {station_id}\n📍 {name}\n🔑 Код: {code}\n\n"
                 "История посещений сохранена и отображается с новым названием.",
-                self.get_admin_menu(),
+                self.menu_for(user_id),
             )
         else:
-            self.bot.send_message(user_id, "Станция не найдена или уже отключена.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Станция не найдена или уже отключена.", self.menu_for(user_id))
 
     def remove_station(self, user_id: int, station_id: int) -> None:
-        if not self.is_admin(user_id):
+        if not self.has_organizer_privileges(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         station = next((s for s in self.db.get_active_stations() if s["id"] == station_id), None)
         if not station:
-            self.bot.send_message(user_id, "Эта станция уже удалена или не найдена.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Эта станция уже удалена или не найдена.", self.menu_for(user_id))
             return
         success = self.db.deactivate_station(station_id)
         if success:
@@ -1586,10 +1664,10 @@ class BotHandler:
                 user_id,
                 f"✅ Станция удалена из активного маршрута: {station['name']}\n\n"
                 "Код больше не принимается. История посещений сохранена; прогресс, статистика и розыгрыш пересчитаны.",
-                self.get_admin_menu(),
+                self.menu_for(user_id),
             )
         else:
-            self.bot.send_message(user_id, "❌ Нельзя удалить последнюю активную станцию.", self.get_admin_menu())
+            self.bot.send_message(user_id, "❌ Нельзя удалить последнюю активную станцию.", self.menu_for(user_id))
 
     # -- Excel export ------------------------------------------------------
     def build_excel_report(self) -> bytes:
@@ -1687,8 +1765,8 @@ class BotHandler:
         return output.getvalue()
 
     def export_excel(self, user_id: int) -> None:
-        if not self.is_admin(user_id):
-            self.bot.send_message(user_id, "❌ Excel-выгрузка доступна только администратору.")
+        if not self.has_organizer_privileges(user_id):
+            self.bot.send_message(user_id, "❌ Excel-выгрузка доступна только организаторам.")
             return
         try:
             content = self.build_excel_report()
@@ -1698,10 +1776,10 @@ class BotHandler:
                 "📊 Отчёт готов. В файле 4 листа: сводка, участники, посещения и статистика по станциям.",
             )
             if not sent:
-                self.bot.send_message(user_id, "⚠️ Excel сформирован, но VK не принял файл. Проверьте права доступа сообщества к сообщениям и документам.", self.get_admin_menu())
+                self.bot.send_message(user_id, "⚠️ Excel сформирован, но VK не принял файл. Проверьте права доступа сообщества к сообщениям и документам.", self.menu_for(user_id))
         except Exception:
             logger.exception("Ошибка формирования Excel")
-            self.bot.send_message(user_id, "❌ Не удалось сформировать Excel. Подробности доступны в логах хостинга.", self.get_admin_menu())
+            self.bot.send_message(user_id, "❌ Не удалось сформировать Excel. Подробности доступны в логах хостинга.", self.menu_for(user_id))
 
     def handle_admin_visit(self, user_id: int, command_text: str) -> str:
         if not self.is_admin(user_id):
@@ -1831,18 +1909,30 @@ class BotHandler:
             )
             return
         if action == "station_admin":
+            if not self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "❌ Управление станциями доступно только организаторам.", self.menu_for(user_id))
+                return
             self.send_station_admin_menu(user_id)
             return
         if action == "station_add":
+            if not self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "❌ Управление станциями доступно только организаторам.", self.menu_for(user_id))
+                return
             self.start_add_station(user_id)
             return
         if action == "station_edit_menu":
+            if not self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "❌ Управление станциями доступно только организаторам.", self.menu_for(user_id))
+                return
             try:
                 self.send_station_edit_menu(user_id, int(payload.get("page", 0)))
             except (TypeError, ValueError):
                 self.send_station_edit_menu(user_id, 0)
             return
         if action == "station_remove_menu":
+            if not self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "❌ Управление станциями доступно только организаторам.", self.menu_for(user_id))
+                return
             try:
                 self.send_station_remove_menu(user_id, int(payload.get("page", 0)))
             except (TypeError, ValueError):
@@ -1851,16 +1941,22 @@ class BotHandler:
         if action == "station_page_noop":
             return
         if action == "station_edit_select":
+            if not self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "❌ Управление станциями доступно только организаторам.", self.menu_for(user_id))
+                return
             try:
                 self.start_edit_station(user_id, int(payload.get("station_id")))
             except (TypeError, ValueError):
-                self.bot.send_message(user_id, "Не удалось определить станцию. Откройте список заново.", self.get_admin_menu())
+                self.bot.send_message(user_id, "Не удалось определить станцию. Откройте список заново.", self.menu_for(user_id))
             return
         if action == "station_remove":
+            if not self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "❌ Управление станциями доступно только организаторам.", self.menu_for(user_id))
+                return
             try:
                 self.remove_station(user_id, int(payload.get("station_id")))
             except (TypeError, ValueError):
-                self.bot.send_message(user_id, "Не удалось определить станцию.", self.get_admin_menu())
+                self.bot.send_message(user_id, "Не удалось определить станцию.", self.menu_for(user_id))
             return
         if action == "cancel_state":
             self.user_states.pop(user_id, None)
@@ -1868,28 +1964,66 @@ class BotHandler:
             self.bot.send_message(user_id, "Действие отменено.", self.menu_for(user_id))
             return
         if action == "raffle_reset_confirm":
-            if self.is_admin(user_id):
+            if self.has_organizer_privileges(user_id):
                 count = self.db.reset_raffle()
-                self.bot.send_message(user_id, f"♻️ История розыгрыша очищена. Сброшено победителей: {count}.", self.get_admin_menu())
+                self.bot.send_message(user_id, f"♻️ История розыгрыша очищена. Сброшено победителей: {count}.", self.menu_for(user_id))
             return
         if action == "raffle_reset_cancel":
-            self.bot.send_message(user_id, "Сброс отменён.", self.get_admin_menu())
+            if self.has_organizer_privileges(user_id):
+                self.bot.send_message(user_id, "Сброс розыгрыша отменён.", self.menu_for(user_id))
+            return
+        if action == "career_reset_start":
+            if self.is_admin(user_id):
+                self.bot.send_message(
+                    user_id,
+                    "⚠️ ПОЛНЫЙ СБРОС ДНЯ КАРЬЕРЫ\n\n"
+                    "Будут безвозвратно удалены регистрации участников и организаторов, "
+                    "все отметки о посещении станций, ограничения между отметками, "
+                    "антиспам-данные и история розыгрыша.\n\n"
+                    "Список станций, их коды и настройки бота сохранятся. "
+                    "Администраторы из ADMIN_IDS сохранят доступ.\n\n"
+                    "Продолжить? Это действие нельзя отменить.",
+                    self.create_keyboard([[
+                        ("🧹 Да, полностью сбросить", "negative", {"action": "career_reset_confirm"}),
+                        ("Отмена", "secondary", {"action": "career_reset_cancel"}),
+                    ]]),
+                )
+            return
+        if action == "career_reset_confirm":
+            if self.is_admin(user_id):
+                self.user_states.clear()
+                self.state_data.clear()
+                counts = self.db.reset_career_day()
+                self.bot.send_message(
+                    user_id,
+                    "✅ ДЕНЬ КАРЬЕРЫ СБРОШЕН\n\n"
+                    f"Удалено регистраций: {counts['participants']} участников;\n"
+                    f"отметок о посещении: {counts['visits']};\n"
+                    f"записей истории розыгрыша: {counts['raffle_draws']};\n"
+                    f"записей ограничений и антиспама: {counts['cooldowns'] + counts['spam_records']}.\n\n"
+                    "Станции и коды сохранены. Можно начинать регистрацию заново.",
+                    self.menu_for(user_id),
+                )
+            return
+        if action == "career_reset_cancel":
+            if self.is_admin(user_id):
+                self.bot.send_message(user_id, "Полный сброс отменён. Данные не изменены.", self.menu_for(user_id))
             return
 
         if self.user_states.get(user_id) == "waiting_station_data":
             if text.lower() == "отмена":
                 self.user_states.pop(user_id, None)
                 self.state_data.pop(user_id, None)
-                self.bot.send_message(user_id, "Добавление станции отменено.", self.get_admin_menu())
-            elif self.is_admin(user_id):
+                self.bot.send_message(user_id, "Добавление станции отменено.", self.menu_for(user_id))
+            elif self.has_organizer_privileges(user_id):
                 self.add_station_from_text(user_id, text)
             return
         if self.user_states.get(user_id) == "waiting_station_edit_data":
             if text.lower() == "отмена":
                 self.user_states.pop(user_id, None)
                 self.state_data.pop(user_id, None)
-                self.bot.send_message(user_id, "Редактирование станции отменено.", self.get_admin_menu())
-            elif self.is_admin(user_id):
+                self.bot.send_message(user_id, "Редактирование станции отменено.", self.menu_for(user_id))
+            elif self.has_organizer_privileges(user_id):
                 self.edit_station_from_text(user_id, text)
             return
         if self.user_states.get(user_id) == "waiting_fio":
@@ -1947,7 +2081,7 @@ class BotHandler:
         elif text == "📊 Excel-отчёт":
             self.export_excel(user_id)
         elif text == "♻️ Сбросить розыгрыш":
-            if self.is_admin(user_id):
+            if self.has_organizer_privileges(user_id):
                 self.bot.send_message(
                     user_id,
                     "Сбросить историю победителей? После подтверждения ранее выбранные участники снова смогут участвовать.",
