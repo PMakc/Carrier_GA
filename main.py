@@ -79,23 +79,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("career_day_vk_bot")
 
-# Стартовый маршрут мероприятия. Кодовые слова можно изменить позже
-# через удаление станции и добавление её заново в панели администратора.
+# Стартовый маршрут мероприятия. Название и код можно редактировать в панели администратора.
 BASE_STATIONS: dict[int, dict[str, str]] = {
-    1: {"name": "АО «Разрез Харанорский»", "code_word": "ХАРАНОР"},
-    2: {"name": "Филиал «Харанорская ГРЭС»", "code_word": "ГРЭС"},
-    3: {"name": "ПАО «ВымпелКом»", "code_word": "БИЛАЙН"},
-    4: {"name": "ГРК «Быстринское»", "code_word": "БЫСТРИНСКОЕ"},
-    5: {"name": "ООО «Удоканская медь»", "code_word": "УДОКАН"},
-    6: {"name": "ООО «Мангазея Майнинг»", "code_word": "МАНГАЗЕЯ"},
-    7: {"name": "ООО «Золото Дельмачик»", "code_word": "ДЕЛЬМАЧИК"},
-    8: {"name": "ПАО «Ростелеком»", "code_word": "РОСТЕЛЕКОМ"},
-    9: {"name": "ПАО «Россети»", "code_word": "РОССЕТИ"},
-    10: {"name": "ПАО «Полюс»", "code_word": "ПОЛЮС"},
-    11: {"name": "АО «Хиагда»", "code_word": "ХИАГДА"},
-    12: {"name": "МКАО «АРЕАЛ»", "code_word": "АРЕАЛ"},
-    13: {"name": "ПАО Сбербанк", "code_word": "СБЕРБАНК"},
-    14: {"name": "АО «Азот-Взрыв»", "code_word": "АЗОТВЗРЫВ"},
+    1: {"name": "АО «Разрез Харанорский»", "code_word": "ХАРАНОР01"},
+    2: {"name": "Филиал «Харанорская ГРЭС»", "code_word": "ГРЭС02"},
+    3: {"name": "ПАО «ВымпелКом»", "code_word": "БИЛАЙН03"},
+    4: {"name": "ГРК «Быстринское»", "code_word": "БЫСТРИНСКОЕ04"},
+    5: {"name": "ООО «Удоканская медь»", "code_word": "УДОКАН05"},
+    6: {"name": "ООО «Мангазея Майнинг»", "code_word": "МАНГАЗЕЯ06"},
+    7: {"name": "ООО «Золото Дельмачик»", "code_word": "ДЕЛЬМАЧИК07"},
+    8: {"name": "ПАО «Ростелеком»", "code_word": "РОСТЕЛЕКОМ08"},
+    9: {"name": "ПАО «Россети»", "code_word": "РОССЕТИ09"},
+    10: {"name": "ПАО «Полюс»", "code_word": "ПОЛЮС10"},
+    11: {"name": "АО «Хиагда»", "code_word": "ХИАГДА11"},
+    12: {"name": "МКАО «АРЕАЛ»", "code_word": "АРЕАЛ12"},
+    13: {"name": "ПАО Сбербанк", "code_word": "СБЕРБАНК13"},
+    14: {"name": "АО «Азот-Взрыв»", "code_word": "АЗОТВЗРЫВ14"},
 }
 
 # Предыдущий стартовый набор. При первом запуске обновлённой версии эти
@@ -116,7 +115,7 @@ LEGACY_DEFAULT_STATIONS: set[tuple[str, str]] = {
     ("Золото Дельмачик", "ЗОЛОТО"),
     ("РОССЕТИ СИБИРЬ – ЧИТАЭНЕРГО", "ЭНЕРГИЯ"),
 }
-STATION_SEED_VERSION = "career-day-2026-14-stations-v1"
+STATION_SEED_VERSION = "career-day-2026-14-stations-v2-numbered-codes"
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +173,8 @@ class Database:
                     last_name TEXT,
                     user_fio TEXT,
                     user_role TEXT DEFAULT 'participant',
+                    role_selected INTEGER NOT NULL DEFAULT 0,
+                    organizer_access INTEGER NOT NULL DEFAULT 0,
                     registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -221,9 +222,25 @@ class Database:
                 """
             )
 
+            # Additive migrations for databases created by earlier bot versions.
+            user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "role_selected" not in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN role_selected INTEGER NOT NULL DEFAULT 0")
+            if "organizer_access" not in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN organizer_access INTEGER NOT NULL DEFAULT 0")
+            # Preserve previously authenticated organizers across upgrades.
+            conn.execute(
+                "UPDATE users SET organizer_access = 1, role_selected = 1 "
+                "WHERE user_role IN ('organizer', 'admin')"
+            )
+            conn.execute(
+                "UPDATE users SET role_selected = 1 WHERE user_fio IS NOT NULL AND role_selected = 0"
+            )
+
             seeded_version = conn.execute(
                 "SELECT setting_value FROM app_settings WHERE setting_key = 'station_seed_version'"
             ).fetchone()
+            previous_seed_version = seeded_version[0] if seeded_version else None
             if not seeded_version or seeded_version[0] != STATION_SEED_VERSION:
                 # Archive only the previous built-in stations. Any extra
                 # stations intentionally created by an admin remain active.
@@ -240,6 +257,34 @@ class Database:
 
                 for index, station in BASE_STATIONS.items():
                     code = station["code_word"].strip().upper()
+
+                    # On v1 -> v2 upgrade, update the existing built-in station
+                    # in place so its ID and all visit history remain intact.
+                    existing_by_name = None
+                    if previous_seed_version == "career-day-2026-14-stations-v1":
+                        existing_by_name = conn.execute(
+                            "SELECT id FROM stations WHERE name = ? ORDER BY id LIMIT 1",
+                            (station["name"],),
+                        ).fetchone()
+                    if existing_by_name:
+                        station_id = int(existing_by_name[0])
+                        collision = conn.execute(
+                            "SELECT id FROM stations WHERE normalized_code = ? AND id <> ?",
+                            (code, station_id),
+                        ).fetchone()
+                        if collision:
+                            logger.warning(
+                                "Не удалось обновить код станции %s: %s уже занят станцией ID %s",
+                                station["name"], code, int(collision[0]),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE stations SET code_word = ?, normalized_code = ?, "
+                                "is_active = 1, deactivated_at = NULL WHERE id = ?",
+                                (code, code, station_id),
+                            )
+                        continue
+
                     exists = conn.execute(
                         "SELECT id FROM stations WHERE normalized_code = ?", (code,)
                     ).fetchone()
@@ -309,7 +354,31 @@ class Database:
 
     def update_role(self, user_id: int, role: str) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE users SET user_role = ? WHERE user_id = ?", (role, user_id))
+            conn.execute(
+                "UPDATE users SET user_role = ?, role_selected = 1 WHERE user_id = ?",
+                (role, user_id),
+            )
+
+    def has_selected_role(self, user_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT role_selected FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return bool(row and row[0])
+
+    def has_organizer_access(self, user_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT organizer_access FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return bool(row and row[0])
+
+    def grant_organizer_access(self, user_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE users SET organizer_access = 1, role_selected = 1, user_role = 'organizer' "
+                "WHERE user_id = ?", (user_id,)
+            )
 
     def get_fio(self, user_id: int) -> str | None:
         with self.connect() as conn:
@@ -416,6 +485,24 @@ class Database:
                 (name.strip(), normalized, normalized),
             )
             return int(cursor.lastrowid)
+
+    def edit_station(self, station_id: int, name: str, code_word: str) -> bool:
+        clean_name = " ".join(name.split())
+        normalized = code_word.strip().upper()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE stations SET name = ?, code_word = ?, normalized_code = ? "
+                "WHERE id = ? AND is_active = 1",
+                (clean_name, normalized, normalized, station_id),
+            )
+            if cursor.rowcount:
+                # Keep the visit register readable after a station rename.
+                conn.execute(
+                    "UPDATE visits SET station_name = ? WHERE station_id = ?",
+                    (clean_name, station_id),
+                )
+                return True
+            return False
 
     def deactivate_station(self, station_id: int) -> bool:
         with self.connect() as conn:
@@ -805,6 +892,7 @@ class BotHandler:
         self.db = db or Database()
         self.bot = bot or VkBot(VK_TOKEN, GROUP_ID)
         self.user_states: dict[int, str] = {}
+        self.state_data: dict[int, dict[str, Any]] = {}
 
     @staticmethod
     def _button(label: str, color: str = "primary", payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -837,9 +925,18 @@ class BotHandler:
     def is_admin(self, user_id: int) -> bool:
         return user_id in ADMIN_IDS
 
+    def get_role_selection_keyboard(self) -> dict[str, Any]:
+        return self.create_keyboard([
+            [
+                ("🎯 Участник", "primary", {"action": "role_select", "role": "participant"}),
+                ("🏢 Организатор", "secondary", {"action": "role_select", "role": "organizer"}),
+            ],
+        ])
+
     def get_participant_menu(self) -> dict[str, Any]:
         return self.create_keyboard([
             [("📊 Мой прогресс", "primary")],
+            [("🔄 Сменить роль", "secondary", {"action": "role_switch"})],
             [("❓ Помощь", "secondary")],
         ])
 
@@ -848,6 +945,7 @@ class BotHandler:
             [("🔑 Коды станций", "primary"), ("📈 Статистика", "primary")],
             [("🏆 Победители", "positive"), ("🎰 Розыгрыш", "positive")],
             [("📋 Полный отчёт", "secondary"), ("❓ Помощь", "secondary")],
+            [("🔄 Сменить роль", "secondary", {"action": "role_switch"})],
         ])
 
     def get_admin_menu(self) -> dict[str, Any]:
@@ -856,64 +954,108 @@ class BotHandler:
             [("🏆 Победители", "positive"), ("🎰 Розыгрыш", "positive")],
             [("🛠 Управление станциями", "primary"), ("📊 Excel-отчёт", "positive")],
             [("♻️ Сбросить розыгрыш", "secondary"), ("❓ Помощь", "secondary")],
+            [("🔄 Сменить роль", "secondary", {"action": "role_switch"})],
         ])
 
     def menu_for(self, user_id: int) -> dict[str, Any]:
+        # An admin may temporarily use the participant interface; elevated
+        # privileges remain configured but are not shown in participant mode.
+        if self.db.get_role(user_id) == "participant":
+            return self.get_participant_menu()
         if self.is_admin(user_id):
             return self.get_admin_menu()
-        return self.get_organizer_menu() if self.db.get_role(user_id) == "organizer" else self.get_participant_menu()
+        return self.get_organizer_menu()
 
     def handle_start(self, user_id: int, username: str | None,
                      first_name: str | None, last_name: str | None) -> None:
         self.db.add_user(user_id, username, first_name, last_name)
         self.user_states.pop(user_id, None)
-        if self.is_admin(user_id):
-            self.db.update_role(user_id, "admin")
+        self.state_data.pop(user_id, None)
+
+        if not self.db.has_selected_role(user_id):
             self.bot.send_message(
                 user_id,
-                "👑 Панель администратора\n\nУправляйте станциями, смотрите статистику, выгружайте Excel и проводите розыгрыш.",
-                self.get_admin_menu(),
+                "👋 Добро пожаловать на День карьеры!\n\n"
+                "Выберите, кем вы будете пользоваться ботом.\n"
+                "Для режима организатора потребуется специальный код доступа.",
+                self.get_role_selection_keyboard(),
             )
             return
+
         role = self.db.get_role(user_id)
+        if role == "admin":
+            self.db.update_role(user_id, "organizer")
+            role = "organizer"
         if role == "organizer":
-            self.bot.send_message(user_id, "🏢 С возвращением! Панель организатора:", self.get_organizer_menu())
-        elif self.db.get_fio(user_id):
-            self.bot.send_message(user_id, "👋 С возвращением! Ваше меню участника:", self.get_participant_menu())
+            self.bot.send_message(user_id, "🏢 С возвращением! Панель организатора:", self.menu_for(user_id))
         else:
-            self.bot.send_message(
-                user_id,
-                "👋 Добро пожаловать на День карьеры!\n\nВыберите, как продолжить:",
-                self.create_keyboard([[("🎯 Участник", "primary"), ("🏢 Организатор", "secondary")]]),
-            )
+            if self.db.get_fio(user_id):
+                self.bot.send_message(user_id, "👋 С возвращением! Ваше меню участника:", self.get_participant_menu())
+            else:
+                self.handle_role_selection(user_id, "🎯 Участник")
 
     def handle_role_selection(self, user_id: int, role: str) -> None:
         if role == "🎯 Участник":
             self.db.update_role(user_id, "participant")
-            self.user_states[user_id] = "waiting_fio"
-            self.bot.send_message(
-                user_id,
-                "🎯 Регистрация участника\n\nВведите ФИО полностью: фамилия, имя и отчество.\nПример: Иванов Иван Иванович.\n\nДля отмены напишите «Отмена».",
-                self.remove_keyboard(),
-            )
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            if self.db.get_fio(user_id):
+                self.bot.send_message(
+                    user_id,
+                    f"👤 Вы переключились в режим участника.\n\nДобро пожаловать, {self.db.get_fio(user_id)}!",
+                    self.get_participant_menu(),
+                )
+            else:
+                self.user_states[user_id] = "waiting_fio"
+                self.bot.send_message(
+                    user_id,
+                    "🎯 Регистрация участника\n\nВведите ФИО полностью: фамилия, имя и отчество.\n"
+                    "Пример: Иванов Иван Иванович.\n\nДля отмены напишите «Отмена».",
+                    self.remove_keyboard(),
+                )
         elif role == "🏢 Организатор":
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            if self.db.has_organizer_access(user_id):
+                self.db.update_role(user_id, "organizer")
+                self.bot.send_message(
+                    user_id,
+                    "🏢 Вы переключились в режим организатора.",
+                    self.menu_for(user_id),
+                )
+                return
             if not ORGANIZER_PASSWORD:
-                self.bot.send_message(user_id, "🔒 Вход организатора временно отключён. Обратитесь к главному администратору.")
+                self.bot.send_message(
+                    user_id,
+                    "🔒 Вход организатора не настроен. Администратор должен задать ORGANIZER_PASSWORD в переменных окружения Bothost.",
+                    self.get_role_selection_keyboard(),
+                )
                 return
             self.user_states[user_id] = "waiting_organizer_password"
             self.bot.send_message(
                 user_id,
-                "🏢 Вход организатора\n\nВведите пароль доступа. Для отмены напишите «Отмена».",
+                "🏢 Вход организатора\n\nВведите специальный код доступа.\n"
+                "После успешного входа вы сможете переключаться между режимами без повторного ввода кода.\n\n"
+                "Для отмены напишите «Отмена».",
                 self.remove_keyboard(),
             )
 
     def handle_organizer_password(self, user_id: int, password: str) -> None:
         self.user_states.pop(user_id, None)
         if secrets.compare_digest(password, ORGANIZER_PASSWORD):
-            self.db.update_role(user_id, "organizer")
-            self.bot.send_message(user_id, "✅ Доступ предоставлен. Панель организатора готова.", self.get_organizer_menu())
+            self.db.grant_organizer_access(user_id)
+            self.bot.send_message(
+                user_id,
+                "✅ Код принят. Доступ организатора сохранён.\n"
+                "Теперь можно переключаться в режим участника и обратно без повторного ввода кода.",
+                self.menu_for(user_id),
+            )
         else:
-            self.bot.send_message(user_id, "❌ Пароль не подошёл. Повторите /start и попробуйте ещё раз.")
+            self.bot.send_message(
+                user_id,
+                "❌ Специальный код не подошёл. Попробуйте снова через /start или выберите режим участника.",
+                self.get_role_selection_keyboard(),
+            )
 
     def handle_fio(self, user_id: int, fio_text: str) -> None:
         fio = " ".join(fio_text.split())
@@ -1076,14 +1218,16 @@ class BotHandler:
             )
 
     def handle_help(self, user_id: int) -> str:
-        role = "admin" if self.is_admin(user_id) else self.db.get_role(user_id)
+        current_role = self.db.get_role(user_id)
+        role = "participant" if current_role == "participant" else ("admin" if self.is_admin(user_id) else current_role)
         if role == "admin":
             return (
                 "❓ ПОМОЩЬ АДМИНИСТРАТОРА\n\n"
-                "• Управление станциями — добавление и отключение станций.\n"
+                "• Управление станциями — добавление, редактирование и отключение станций.\n"
                 "• Excel-отчёт — сводка, участники и подробный журнал посещений.\n"
                 "• Розыгрыш — последовательный выбор победителей без повторов.\n"
                 "• Сбросить розыгрыш — очистить историю выбранных победителей.\n\n"
+                "• Сменить роль — перейти в режим участника без потери прав организатора.\n\n"
                 "Команды: /visit_ID [VK_ID], /complete_all VK_ID, /export."
             )
         if role == "organizer":
@@ -1092,6 +1236,8 @@ class BotHandler:
                 "• Коды станций — список кодовых слов.\n"
                 "• Статистика и победители — результаты мероприятия.\n"
                 "• Розыгрыш — случайный выбор среди прошедших все активные станции.\n\n"
+                "Кнопка «Сменить роль» позволяет переключиться в режим участника.\n"
+                "После первого ввода специального кода повторно вводить его не потребуется.\n\n"
                 "Для отметки участника администратор использует /visit_ID [VK_ID]."
             )
         return (
@@ -1100,7 +1246,8 @@ class BotHandler:
             "2. Получите кодовое слово у представителя.\n"
             "3. Отправьте кодовое слово в чат.\n"
             "4. Следите за прогрессом в разделе «Мой прогресс».\n\n"
-            f"Между отметками действует интервал {MIN_TIME_BETWEEN_STATIONS // 60} мин."
+            f"Между отметками действует интервал {MIN_TIME_BETWEEN_STATIONS // 60} мин.\n\n"
+            "Кнопка «Сменить роль» открывает режим организатора (потребуется специальный код)."
         )
 
     # -- Admin station management -----------------------------------------
@@ -1114,65 +1261,202 @@ class BotHandler:
             lines.append(f"{station['id']}. {station['name']} — код: {station['code_word']}")
         keyboard = self.create_keyboard([
             [("➕ Добавить станцию", "positive", {"action": "station_add"})],
-            [("➖ Убрать станцию", "negative", {"action": "station_remove_menu"})],
+            [("✏️ Редактировать станцию", "primary", {"action": "station_edit_menu", "page": 0})],
+            [("🗑 Удалить станцию", "negative", {"action": "station_remove_menu", "page": 0})],
             [("↩️ В меню", "secondary", {"action": "main_menu"})],
         ])
         self.bot.send_message(user_id, "\n".join(lines), keyboard)
 
-    def send_station_remove_menu(self, user_id: int) -> None:
+    def _station_picker_keyboard(self, stations: list[dict[str, Any]], mode: str,
+                                  page: int = 0) -> dict[str, Any]:
+        # VK standard keyboards allow at most 10 rows. Use 16 stations per
+        # page (two buttons per row), plus navigation and a Back row.
+        page_size = 16
+        total_pages = max(1, (len(stations) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        visible = stations[page * page_size:(page + 1) * page_size]
+        prefix = "✏️" if mode == "edit" else "🗑"
+        action = "station_edit_select" if mode == "edit" else "station_remove"
+        rows: list[list[Any]] = []
+        current_row: list[Any] = []
+        for station in visible:
+            label = f"{prefix} {station['id']} — {station['name']}"
+            current_row.append((label[:40], "primary" if mode == "edit" else "negative", {
+                "action": action,
+                "station_id": int(station["id"]),
+            }))
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+        if current_row:
+            rows.append(current_row)
+
+        if total_pages > 1:
+            nav_row: list[Any] = []
+            if page > 0:
+                nav_row.append(("⬅️ Назад", "secondary", {
+                    "action": "station_edit_menu" if mode == "edit" else "station_remove_menu",
+                    "page": page - 1,
+                }))
+            nav_row.append((f"{page + 1}/{total_pages}", "secondary", {"action": "station_page_noop"}))
+            if page + 1 < total_pages:
+                nav_row.append(("Вперёд ➡️", "secondary", {
+                    "action": "station_edit_menu" if mode == "edit" else "station_remove_menu",
+                    "page": page + 1,
+                }))
+            rows.append(nav_row)
+        rows.append([("↩️ К станциям", "secondary", {"action": "station_admin"})])
+        return self.create_keyboard(rows)
+
+    def send_station_remove_menu(self, user_id: int, page: int = 0) -> None:
         if not self.is_admin(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         stations = self.db.get_active_stations()
         if len(stations) <= 1:
-            self.bot.send_message(user_id, "Нельзя отключить последнюю активную станцию.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Нельзя удалить последнюю активную станцию.", self.get_admin_menu())
             return
-        rows = []
-        for station in stations:
-            label = f"🗑 {station['id']} — {station['name']}"
-            # VK button labels are length-limited; the ID in payload is authoritative.
-            rows.append([(label[:40], "negative", {"action": "station_remove", "station_id": station["id"]})])
-        rows.append([("↩️ Назад", "secondary", {"action": "station_admin"})])
-        self.bot.send_message(user_id, "Выберите станцию, которую нужно отключить:\nИстория посещений сохранится, но станция исчезнет из текущего маршрута.", self.create_keyboard(rows))
+        self.bot.send_message(
+            user_id,
+            "🗑 ВЫБЕРИТЕ СТАНЦИЮ ДЛЯ УДАЛЕНИЯ\n\n"
+            "Станция будет отключена от маршрута: код перестанет приниматься, "
+            "прогресс и розыгрыш пересчитаются. История посещений сохранится.\n"
+            "Список разбит на страницы, чтобы кнопки корректно работали в VK.",
+            self._station_picker_keyboard(stations, "remove", page),
+        )
+
+    def send_station_edit_menu(self, user_id: int, page: int = 0) -> None:
+        if not self.is_admin(user_id):
+            self.bot.send_message(user_id, "❌ Недостаточно прав.")
+            return
+        stations = self.db.get_active_stations()
+        if not stations:
+            self.bot.send_message(user_id, "Нет активных станций для редактирования.", self.get_admin_menu())
+            return
+        self.bot.send_message(
+            user_id,
+            "✏️ ВЫБЕРИТЕ СТАНЦИЮ ДЛЯ РЕДАКТИРОВАНИЯ\n\n"
+            "После выбора отправьте новое название и код в формате: "
+            "Название станции | НОВЫЙ_КОД01\n"
+            "Чтобы оставить название или код прежними, повторите их без изменений.",
+            self._station_picker_keyboard(stations, "edit", page),
+        )
+
+    def start_edit_station(self, user_id: int, station_id: int) -> None:
+        if not self.is_admin(user_id):
+            self.bot.send_message(user_id, "❌ Недостаточно прав.")
+            return
+        station = next((s for s in self.db.get_active_stations() if int(s["id"]) == station_id), None)
+        if not station:
+            self.bot.send_message(user_id, "Эта станция уже отключена или не найдена.", self.get_admin_menu())
+            return
+        self.user_states[user_id] = "waiting_station_edit_data"
+        self.state_data[user_id] = {"station_id": station_id}
+        self.bot.send_message(
+            user_id,
+            f"✏️ РЕДАКТИРОВАНИЕ СТАНЦИИ №{station_id}\n\n"
+            f"Текущее название: {station['name']}\n"
+            f"Текущий код: {station['code_word']}\n\n"
+            "Отправьте новое название и код через вертикальную черту:\n"
+            "Новое название | НОВЫЙ_КОД01\n\n"
+            "Код может содержать русские/латинские буквы и цифры. Для отмены напишите «Отмена».",
+            self.create_keyboard([[("Отмена", "secondary", {"action": "cancel_state"})]]),
+        )
 
     def start_add_station(self, user_id: int) -> None:
         if not self.is_admin(user_id):
             self.bot.send_message(user_id, "❌ Недостаточно прав.")
             return
         self.user_states[user_id] = "waiting_station_data"
+        self.state_data.pop(user_id, None)
         self.bot.send_message(
             user_id,
             "➕ ДОБАВЛЕНИЕ СТАНЦИИ\n\n"
             "Отправьте данные одним сообщением в формате:\n"
-            "Название станции | КОДОВОЕ_СЛОВО\n\n"
+            "Название станции | КОДОВОЕ_СЛОВО01\n\n"
             "Пример: Новое предприятие | МЕДЬ2026\n\n"
-            "Код должен быть уникальным. Для отмены напишите «Отмена».",
+            "Код: от 2 до 32 символов, буквы/цифры/дефис/подчёркивание. Для отмены — «Отмена».",
             self.create_keyboard([[ ("Отмена", "secondary", {"action": "cancel_state"}) ]]),
         )
 
-    def add_station_from_text(self, user_id: int, text: str) -> None:
-        self.user_states.pop(user_id, None)
+    @staticmethod
+    def _parse_station_form(text: str) -> tuple[str, str] | None:
         parts = re.split(r"\s*[|;]\s*", text.strip(), maxsplit=1)
         if len(parts) != 2:
-            self.bot.send_message(user_id, "⚠️ Формат не распознан. Нужно: Название станции | КОДОВОЕ_СЛОВО", self.get_admin_menu())
-            return
-        name, code = parts[0].strip(), parts[1].strip().upper()
+            return None
+        name, code = " ".join(parts[0].split()), parts[1].strip().upper()
         if not (2 <= len(name) <= 90):
-            self.bot.send_message(user_id, "Название станции должно содержать от 2 до 90 символов.", self.get_admin_menu())
-            return
+            return None
         if not re.fullmatch(r"[A-ZА-ЯЁ0-9_-]{2,32}", code):
-            self.bot.send_message(user_id, "Код: от 2 до 32 символов — только буквы, цифры, дефис или подчёркивание.", self.get_admin_menu())
+            return None
+        return name, code
+
+    def add_station_from_text(self, user_id: int, text: str) -> None:
+        parsed = self._parse_station_form(text)
+        if not parsed:
+            self.bot.send_message(
+                user_id,
+                "⚠️ Не удалось распознать данные.\nФормат: Название станции | КОД2026\n"
+                "Название: 2–90 символов; код: 2–32 символа, буквы и цифры. Попробуйте ещё раз или отмените действие.",
+                self.create_keyboard([[ ("Отмена", "secondary", {"action": "cancel_state"}) ]]),
+            )
             return
+        name, code = parsed
         try:
             station_id = self.db.add_station(name, code)
         except sqlite3.IntegrityError:
-            self.bot.send_message(user_id, "❌ Такой код уже используется активной или архивной станцией. Выберите другой.", self.get_admin_menu())
+            self.bot.send_message(
+                user_id,
+                "❌ Такой код уже используется активной или архивной станцией. Введите другой код.",
+                self.create_keyboard([[ ("Отмена", "secondary", {"action": "cancel_state"}) ]]),
+            )
             return
+        self.user_states.pop(user_id, None)
+        self.state_data.pop(user_id, None)
         self.bot.send_message(
             user_id,
-            f"✅ Станция добавлена!\n\n📍 {name}\n🔑 Код: {code}\n🆔 ID: {station_id}\nКоманда отметки: /visit_{station_id}",
+            f"✅ Станция добавлена!\n\n📍 {name}\n🔑 Код: {code}\n🆔 ID: {station_id}\n"
+            f"Команда ручной отметки: /visit_{station_id}",
             self.get_admin_menu(),
         )
+
+    def edit_station_from_text(self, user_id: int, text: str) -> None:
+        station_id = int(self.state_data.get(user_id, {}).get("station_id", 0))
+        parsed = self._parse_station_form(text)
+        if not station_id:
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            self.bot.send_message(user_id, "Не удалось определить выбранную станцию. Откройте редактирование заново.", self.get_admin_menu())
+            return
+        if not parsed:
+            self.bot.send_message(
+                user_id,
+                "⚠️ Неверный формат. Отправьте: Новое название | НОВЫЙ_КОД01\n"
+                "Название: 2–90 символов; код: 2–32 символа, буквы/цифры. Попробуйте ещё раз.",
+                self.create_keyboard([[ ("Отмена", "secondary", {"action": "cancel_state"}) ]]),
+            )
+            return
+        name, code = parsed
+        try:
+            updated = self.db.edit_station(station_id, name, code)
+        except sqlite3.IntegrityError:
+            self.bot.send_message(
+                user_id,
+                "❌ Этот код уже закреплён за другой станцией (в том числе архивной). Введите уникальный код.",
+                self.create_keyboard([[ ("Отмена", "secondary", {"action": "cancel_state"}) ]]),
+            )
+            return
+        self.user_states.pop(user_id, None)
+        self.state_data.pop(user_id, None)
+        if updated:
+            self.bot.send_message(
+                user_id,
+                f"✅ Станция обновлена!\n\n🆔 ID: {station_id}\n📍 {name}\n🔑 Код: {code}\n\n"
+                "История посещений сохранена и отображается с новым названием.",
+                self.get_admin_menu(),
+            )
+        else:
+            self.bot.send_message(user_id, "Станция не найдена или уже отключена.", self.get_admin_menu())
 
     def remove_station(self, user_id: int, station_id: int) -> None:
         if not self.is_admin(user_id):
@@ -1180,17 +1464,18 @@ class BotHandler:
             return
         station = next((s for s in self.db.get_active_stations() if s["id"] == station_id), None)
         if not station:
-            self.bot.send_message(user_id, "Эта станция уже отключена или не найдена.", self.get_admin_menu())
+            self.bot.send_message(user_id, "Эта станция уже удалена или не найдена.", self.get_admin_menu())
             return
         success = self.db.deactivate_station(station_id)
         if success:
             self.bot.send_message(
                 user_id,
-                f"✅ Станция отключена: {station['name']}\n\nИстория посещений сохранена. Прогресс и условия розыгрыша пересчитаны по активным станциям.",
+                f"✅ Станция удалена из активного маршрута: {station['name']}\n\n"
+                "Код больше не принимается. История посещений сохранена; прогресс, статистика и розыгрыш пересчитаны.",
                 self.get_admin_menu(),
             )
         else:
-            self.bot.send_message(user_id, "❌ Нельзя отключить последнюю активную станцию.", self.get_admin_menu())
+            self.bot.send_message(user_id, "❌ Нельзя удалить последнюю активную станцию.", self.get_admin_menu())
 
     # -- Excel export ------------------------------------------------------
     def build_excel_report(self) -> bytes:
@@ -1388,11 +1673,21 @@ class BotHandler:
         text = str(message.get("text", "")).strip()
         payload = self._parse_payload(message.get("payload"))
 
-        can_send, spam_message = self.db.check_spam_protection(user_id)
-        if not can_send:
-            if spam_message:
-                self.bot.send_message(user_id, spam_message)
-            return
+        # Button presses carry a validated VK payload. Do not throttle them:
+        # rapid taps on menus must not make station management or role switching
+        # appear broken. Free-text messages and codes still use anti-spam.
+        waiting_for_input = self.user_states.get(user_id) in {
+            "waiting_station_data",
+            "waiting_station_edit_data",
+            "waiting_fio",
+            "waiting_organizer_password",
+        }
+        if not payload and not waiting_for_input:
+            can_send, spam_message = self.db.check_spam_protection(user_id)
+            if not can_send:
+                if spam_message:
+                    self.bot.send_message(user_id, spam_message)
+                return
 
         if text.lower() in ("/start", "начать", "start"):
             username, first_name, last_name = self.bot.get_user(user_id)
@@ -1400,8 +1695,26 @@ class BotHandler:
             return
 
         action = payload.get("action")
+        if action == "role_select":
+            role_value = payload.get("role")
+            if role_value == "participant":
+                self.handle_role_selection(user_id, "🎯 Участник")
+            elif role_value == "organizer":
+                self.handle_role_selection(user_id, "🏢 Организатор")
+            else:
+                self.bot.send_message(user_id, "Не удалось определить выбранный режим. Напишите /start.")
+            return
         if action == "main_menu":
             self.bot.send_message(user_id, "Главное меню:", self.menu_for(user_id))
+            return
+        if action == "role_switch":
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            self.bot.send_message(
+                user_id,
+                "🔄 Смена режима\n\nВыберите, как использовать бота:",
+                self.get_role_selection_keyboard(),
+            )
             return
         if action == "station_admin":
             self.send_station_admin_menu(user_id)
@@ -1409,18 +1722,36 @@ class BotHandler:
         if action == "station_add":
             self.start_add_station(user_id)
             return
+        if action == "station_edit_menu":
+            try:
+                self.send_station_edit_menu(user_id, int(payload.get("page", 0)))
+            except (TypeError, ValueError):
+                self.send_station_edit_menu(user_id, 0)
+            return
         if action == "station_remove_menu":
-            self.send_station_remove_menu(user_id)
+            try:
+                self.send_station_remove_menu(user_id, int(payload.get("page", 0)))
+            except (TypeError, ValueError):
+                self.send_station_remove_menu(user_id, 0)
+            return
+        if action == "station_page_noop":
+            return
+        if action == "station_edit_select":
+            try:
+                self.start_edit_station(user_id, int(payload.get("station_id")))
+            except (TypeError, ValueError):
+                self.bot.send_message(user_id, "Не удалось определить станцию. Откройте список заново.", self.get_admin_menu())
             return
         if action == "station_remove":
             try:
                 self.remove_station(user_id, int(payload.get("station_id")))
             except (TypeError, ValueError):
-                self.bot.send_message(user_id, "Не удалось определить станцию.")
+                self.bot.send_message(user_id, "Не удалось определить станцию.", self.get_admin_menu())
             return
         if action == "cancel_state":
             self.user_states.pop(user_id, None)
-            self.bot.send_message(user_id, "Действие отменено.", self.get_admin_menu() if self.is_admin(user_id) else self.menu_for(user_id))
+            self.state_data.pop(user_id, None)
+            self.bot.send_message(user_id, "Действие отменено.", self.menu_for(user_id))
             return
         if action == "raffle_reset_confirm":
             if self.is_admin(user_id):
@@ -1434,9 +1765,18 @@ class BotHandler:
         if self.user_states.get(user_id) == "waiting_station_data":
             if text.lower() == "отмена":
                 self.user_states.pop(user_id, None)
+                self.state_data.pop(user_id, None)
                 self.bot.send_message(user_id, "Добавление станции отменено.", self.get_admin_menu())
             elif self.is_admin(user_id):
                 self.add_station_from_text(user_id, text)
+            return
+        if self.user_states.get(user_id) == "waiting_station_edit_data":
+            if text.lower() == "отмена":
+                self.user_states.pop(user_id, None)
+                self.state_data.pop(user_id, None)
+                self.bot.send_message(user_id, "Редактирование станции отменено.", self.get_admin_menu())
+            elif self.is_admin(user_id):
+                self.edit_station_from_text(user_id, text)
             return
         if self.user_states.get(user_id) == "waiting_fio":
             if text.lower() == "отмена":
@@ -1453,7 +1793,15 @@ class BotHandler:
                 self.handle_organizer_password(user_id, text)
             return
 
-        if text in ("🎯 Участник", "🏢 Организатор"):
+        if text == "🔄 Сменить роль":
+            self.user_states.pop(user_id, None)
+            self.state_data.pop(user_id, None)
+            self.bot.send_message(
+                user_id,
+                "🔄 Смена режима\n\nВыберите, как использовать бота:",
+                self.get_role_selection_keyboard(),
+            )
+        elif text in ("🎯 Участник", "🏢 Организатор"):
             self.handle_role_selection(user_id, text)
         elif text == "📊 Мой прогресс":
             self.bot.send_message(user_id, self.handle_my_progress(user_id), self.menu_for(user_id))
@@ -1474,6 +1822,14 @@ class BotHandler:
             self.bot.send_message(user_id, self.handle_help(user_id), self.menu_for(user_id))
         elif text == "🛠 Управление станциями":
             self.send_station_admin_menu(user_id)
+        elif text.startswith("✏️ "):
+            match = re.match(r"^✏️\s+(\d+)\s+—", text)
+            if match:
+                self.start_edit_station(user_id, int(match.group(1)))
+        elif text.startswith("🗑 "):
+            match = re.match(r"^🗑\s+(\d+)\s+—", text)
+            if match:
+                self.remove_station(user_id, int(match.group(1)))
         elif text == "📊 Excel-отчёт":
             self.export_excel(user_id)
         elif text == "♻️ Сбросить розыгрыш":
