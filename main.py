@@ -81,20 +81,40 @@ logger = logging.getLogger("career_day_vk_bot")
 
 # Стартовый маршрут мероприятия. Название и код можно редактировать в панели администратора.
 BASE_STATIONS: dict[int, dict[str, str]] = {
-    1: {"name": "АО «Разрез Харанорский»", "code_word": "ХАРАНОР01"},
-    2: {"name": "Филиал «Харанорская ГРЭС»", "code_word": "ГРЭС02"},
-    3: {"name": "ПАО «ВымпелКом»", "code_word": "БИЛАЙН03"},
-    4: {"name": "ГРК «Быстринское»", "code_word": "БЫСТРИНСКОЕ04"},
-    5: {"name": "ООО «Удоканская медь»", "code_word": "УДОКАН05"},
-    6: {"name": "ООО «Мангазея Майнинг»", "code_word": "МАНГАЗЕЯ06"},
-    7: {"name": "ООО «Золото Дельмачик»", "code_word": "ДЕЛЬМАЧИК07"},
-    8: {"name": "ПАО «Ростелеком»", "code_word": "РОСТЕЛЕКОМ08"},
-    9: {"name": "ПАО «Россети»", "code_word": "РОССЕТИ09"},
-    10: {"name": "ПАО «Полюс»", "code_word": "ПОЛЮС10"},
-    11: {"name": "АО «Хиагда»", "code_word": "ХИАГДА11"},
-    12: {"name": "МКАО «АРЕАЛ»", "code_word": "АРЕАЛ12"},
-    13: {"name": "ПАО Сбербанк", "code_word": "СБЕРБАНК13"},
-    14: {"name": "АО «Азот-Взрыв»", "code_word": "АЗОТВЗРЫВ14"},
+    1: {"name": "АО «Разрез Харанорский»", "code_word": "КСЕНОЛИТ-73164"},
+    2: {"name": "Филиал «Харанорская ГРЭС»", "code_word": "ГЕОФОН-48291"},
+    3: {"name": "ПАО «ВымпелКом»", "code_word": "ПЕГМАТИТ-91638"},
+    4: {"name": "ГРК «Быстринское»", "code_word": "ИЗОГИПС-35742"},
+    5: {"name": "ООО «Удоканская медь»", "code_word": "ШЛИХ-82419"},
+    6: {"name": "ООО «Мангазея Майнинг»", "code_word": "АНКЕР-59386"},
+    7: {"name": "ООО «Золото Дельмачик»", "code_word": "ФЛЮС-26851"},
+    8: {"name": "ПАО «Ростелеком»", "code_word": "СОРБЦИЯ-74195"},
+    9: {"name": "ПАО «Россети»", "code_word": "КЕРН-63924"},
+    10: {"name": "ПАО «Полюс»", "code_word": "ШУРФ-42578"},
+    11: {"name": "АО «Хиагда»", "code_word": "ДЕФОРМАЦИЯ-87316"},
+    12: {"name": "МКАО «АРЕАЛ»", "code_word": "КРИСТАЛЛ-19465"},
+    13: {"name": "ПАО Сбербанк", "code_word": "ЛИТОСФЕРА-58632"},
+    14: {"name": "АО «Азот-Взрыв»", "code_word": "ГЕОДЕЗИЯ-93274"},
+}
+
+# Миграция предыдущего набора простых кодов на тематические коды с
+# непоследовательными пятизначными суффиксами. Обновляем запись станции
+# на месте: её ID и история посещений остаются неизменными.
+PREVIOUS_NUMBERED_CODES: dict[str, str] = {
+    "ХАРАНОР01": "КСЕНОЛИТ-73164",
+    "ГРЭС02": "ГЕОФОН-48291",
+    "БИЛАЙН03": "ПЕГМАТИТ-91638",
+    "БЫСТРИНСКОЕ04": "ИЗОГИПС-35742",
+    "УДОКАН05": "ШЛИХ-82419",
+    "МАНГАЗЕЯ06": "АНКЕР-59386",
+    "ДЕЛЬМАЧИК07": "ФЛЮС-26851",
+    "РОСТЕЛЕКОМ08": "СОРБЦИЯ-74195",
+    "РОССЕТИ09": "КЕРН-63924",
+    "ПОЛЮС10": "ШУРФ-42578",
+    "ХИАГДА11": "ДЕФОРМАЦИЯ-87316",
+    "АРЕАЛ12": "КРИСТАЛЛ-19465",
+    "СБЕРБАНК13": "ЛИТОСФЕРА-58632",
+    "АЗОТВЗРЫВ14": "ГЕОДЕЗИЯ-93274",
 }
 
 # Предыдущий стартовый набор. При первом запуске обновлённой версии эти
@@ -115,7 +135,7 @@ LEGACY_DEFAULT_STATIONS: set[tuple[str, str]] = {
     ("Золото Дельмачик", "ЗОЛОТО"),
     ("РОССЕТИ СИБИРЬ – ЧИТАЭНЕРГО", "ЭНЕРГИЯ"),
 }
-STATION_SEED_VERSION = "career-day-2026-14-stations-v2-numbered-codes"
+STATION_SEED_VERSION = "career-day-2026-14-stations-v3-thematic-codes"
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +275,33 @@ class Database:
                             (datetime.now().isoformat(timespec="seconds"), int(old_row[0])),
                         )
 
+                # Обновляем именно прежние стартовые коды на новые. Это сохраняет
+                # ID станций и посещения, не затрагивая коды пользовательских станций.
+                migrated_station_ids: set[int] = set()
+                for old_code, new_code in PREVIOUS_NUMBERED_CODES.items():
+                    old_row = conn.execute(
+                        "SELECT id FROM stations WHERE normalized_code = ?",
+                        (old_code,),
+                    ).fetchone()
+                    if not old_row:
+                        continue
+                    station_id = int(old_row[0])
+                    collision = conn.execute(
+                        "SELECT id FROM stations WHERE normalized_code = ? AND id <> ?",
+                        (new_code, station_id),
+                    ).fetchone()
+                    if collision:
+                        logger.warning(
+                            "Не удалось обновить код станции ID %s: код %s уже занят станцией ID %s",
+                            station_id, new_code, int(collision[0]),
+                        )
+                        continue
+                    conn.execute(
+                        "UPDATE stations SET code_word = ?, normalized_code = ? WHERE id = ?",
+                        (new_code, new_code, station_id),
+                    )
+                    migrated_station_ids.add(station_id)
+
                 for index, station in BASE_STATIONS.items():
                     code = station["code_word"].strip().upper()
 
@@ -289,17 +336,13 @@ class Database:
                         "SELECT id FROM stations WHERE normalized_code = ?", (code,)
                     ).fetchone()
                     if exists:
-                        # Do not silently overwrite an admin-created station
-                        # that already owns this code word.
-                        if conn.execute(
+                        # Existing entries are left as-is. In particular, do not
+                        # reactivate a station that an administrator intentionally
+                        # disabled before this code update.
+                        if int(exists[0]) not in migrated_station_ids and not conn.execute(
                             "SELECT 1 FROM stations WHERE id = ? AND name = ?",
                             (int(exists[0]), station["name"]),
                         ).fetchone():
-                            conn.execute(
-                                "UPDATE stations SET is_active = 1, deactivated_at = NULL WHERE id = ?",
-                                (int(exists[0]),),
-                            )
-                        else:
                             logger.warning(
                                 "Не удалось добавить стартовую станцию %s: код %s уже занят другой станцией",
                                 station["name"], code,
@@ -565,6 +608,31 @@ class Database:
                    ORDER BY v.visited_at""", (user_id,)
             ).fetchall()
             return [(row[0], row[1]) for row in rows]
+
+    def get_user_station_progress(self, user_id: int) -> list[dict[str, Any]]:
+        """Return every active station and its visit timestamp for one user.
+
+        A LEFT JOIN is intentional: stations without a visit must also appear
+        so the participant can see what remains to be completed.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT s.id, s.name, v.visited_at
+                   FROM stations s
+                   LEFT JOIN visits v
+                     ON v.station_id = s.id AND v.user_id = ?
+                   WHERE s.is_active = 1
+                   ORDER BY s.id""",
+                (user_id,),
+            ).fetchall()
+            return [
+                {
+                    "id": int(row[0]),
+                    "name": str(row[1]),
+                    "visited_at": str(row[2]) if row[2] else None,
+                }
+                for row in rows
+            ]
 
     def get_all_participants(self) -> list[tuple[int, str, str | None]]:
         with self.connect() as conn:
@@ -1086,24 +1154,46 @@ class BotHandler:
     def handle_my_progress(self, user_id: int) -> str:
         if self.db.get_role(user_id) != "participant" or not self.db.get_fio(user_id):
             return "Сначала зарегистрируйтесь как участник через /start."
-        stats = self.db.get_user_stats(user_id)
-        visits = self.db.get_visits(user_id)
+
+        # Build the summary and the checklist from the same active-stations
+        # snapshot so the totals always match the detailed list below.
+        station_progress = self.db.get_user_station_progress(user_id)
+        total_stations = len(station_progress)
+        visited_count = sum(1 for station in station_progress if station["visited_at"])
+        remaining_count = max(0, total_stations - visited_count)
+        completed = total_stations > 0 and visited_count >= total_stations
         can_visit, remaining = self.db.can_visit_station(user_id)
+
         response = (
             f"👤 {self.db.get_fio(user_id)}\n\n"
-            f"📊 Прогресс: {stats['visited_count']} из {stats['total_stations']} станций\n"
-            f"{self._progress_bar(int(stats['visited_count']), int(stats['total_stations']))}\n"
-            f"Осталось: {stats['remaining']}"
+            f"📊 Прогресс: {visited_count} из {total_stations} станций\n"
+            f"{self._progress_bar(visited_count, total_stations)}\n"
+            f"Осталось: {remaining_count}"
         )
-        if stats["completed"]:
+
+        if completed:
             response += "\n\n🎉 Маршрут завершён! Вы участвуете в розыгрыше."
         elif not can_visit:
             minutes, seconds = divmod(int(remaining), 60)
             response += f"\n\n⏱ Следующая отметка будет доступна через {minutes} мин {seconds} сек."
-        if visits:
-            response += "\n\n✅ Посещённые станции:\n" + "\n".join(
-                f"• {name} — {visited_at[:16].replace('T', ' ')}" for name, visited_at in visits
-            )
+
+        response += "\n\n🗺 СТАНЦИИ МАРШРУТА:"
+        if station_progress:
+            for index, station in enumerate(station_progress, 1):
+                if station["visited_at"]:
+                    raw_timestamp = str(station["visited_at"])
+                    try:
+                        visit_time = datetime.fromisoformat(raw_timestamp).strftime("%d.%m %H:%M")
+                    except ValueError:
+                        visit_time = raw_timestamp[:16].replace("T", " ")
+                    response += (
+                        f"\n✅ {index}. {station['name']} — пройдена ({visit_time})"
+                    )
+                else:
+                    response += f"\n⬜ {index}. {station['name']} — не пройдена"
+        else:
+            response += "\nПока нет активных станций. Обратитесь к организатору."
+
         return response
 
     def handle_actual_codes(self, user_id: int) -> str:
