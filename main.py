@@ -59,7 +59,7 @@ def _parse_admin_ids() -> set[int]:
 VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
 GROUP_ID = _env_int("VK_GROUP_ID", 241674433)
 ADMIN_IDS = _parse_admin_ids()
-ORGANIZER_PASSWORD = os.getenv("ORGANIZER_PASSWORD", "")
+ORGANIZER_PASSWORD = os.getenv("ORGANIZER_PASSWORD", "").strip()
 API_VERSION = os.getenv("VK_API_VERSION", "5.199")
 MIN_TIME_BETWEEN_STATIONS = _env_int("MIN_TIME_BETWEEN_STATIONS", 180)
 ANTI_SPAM_COOLDOWN = _env_int("ANTI_SPAM_COOLDOWN", 2)
@@ -417,10 +417,21 @@ class Database:
             return bool(row and row[0])
 
     def grant_organizer_access(self, user_id: int) -> None:
+        """Persist organizer access even when the user row is unexpectedly absent.
+
+        A plain UPDATE silently affects zero rows when the user has not yet been
+        inserted into this database (for example after a database-path change).
+        UPSERT makes successful password authentication durable in either case.
+        """
         with self.connect() as conn:
             conn.execute(
-                "UPDATE users SET organizer_access = 1, role_selected = 1, user_role = 'organizer' "
-                "WHERE user_id = ?", (user_id,)
+                """INSERT INTO users (user_id, user_role, role_selected, organizer_access)
+                   VALUES (?, 'organizer', 1, 1)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       organizer_access = 1,
+                       role_selected = 1,
+                       user_role = 'organizer'""",
+                (user_id,),
             )
 
     def get_fio(self, user_id: int) -> str | None:
@@ -1199,15 +1210,42 @@ class BotHandler:
 
     def handle_organizer_password(self, user_id: int, password: str) -> None:
         self.user_states.pop(user_id, None)
-        if secrets.compare_digest(password, ORGANIZER_PASSWORD):
-            self.db.grant_organizer_access(user_id)
+        if secrets.compare_digest(password.strip(), ORGANIZER_PASSWORD):
+            try:
+                self.db.grant_organizer_access(user_id)
+                access_saved = (
+                    self.db.has_organizer_access(user_id)
+                    and self.db.get_role(user_id) == "organizer"
+                    and self.db.has_selected_role(user_id)
+                )
+            except Exception:
+                logger.exception("Не удалось сохранить доступ организатора для VK ID %s", user_id)
+                access_saved = False
+
+            if not access_saved:
+                logger.error(
+                    "Проверка сохранения доступа не пройдена для VK ID %s; DB_PATH=%s",
+                    user_id, DB_PATH,
+                )
+                self.bot.send_message(
+                    user_id,
+                    "⚠️ Код верный, но не удалось сохранить доступ в базе данных. "
+                    "Сообщите администратору — повторно вводить код пока не нужно.",
+                    self.get_role_selection_keyboard(),
+                )
+                return
+
+            logger.info("Организатор успешно авторизован и сохранён: VK ID %s", user_id)
+            organizer_menu = self.get_admin_menu() if self.is_admin(user_id) else self.get_organizer_menu()
             self.bot.send_message(
                 user_id,
                 "✅ Код принят. Доступ организатора сохранён.\n"
-                "Теперь можно переключаться в режим участника и обратно без повторного ввода кода.",
-                self.menu_for(user_id),
+                "Вы вошли в панель организатора. Теперь можно переключаться в режим участника "
+                "и обратно без повторного ввода кода.",
+                organizer_menu,
             )
         else:
+            logger.warning("Неверный код организатора введён пользователем VK ID %s", user_id)
             self.bot.send_message(
                 user_id,
                 "❌ Специальный код не подошёл. Попробуйте снова через /start или выберите режим участника.",
