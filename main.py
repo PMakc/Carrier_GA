@@ -895,17 +895,41 @@ class VkBot:
             logger.error("Не удалось загрузить Excel в VK: %s", exc)
             return False
 
-        saved = self.call("docs.save", file=upload_result.get("file"), title=filename)
+        uploaded_file = upload_result.get("file") if isinstance(upload_result, dict) else None
+        if not uploaded_file:
+            logger.error("VK upload endpoint did not return a file token")
+            return False
+
+        saved = self.call("docs.save", file=uploaded_file, title=filename)
         if not saved:
+            logger.error("VK docs.save did not return a document")
             return False
-        document = saved[0] if isinstance(saved, list) and saved else saved
+
+        # VK API v5.199 returns {type: 'doc', doc: {...}}; tolerate wrappers
+        # that expose a list or the document object directly.
+        if isinstance(saved, dict) and isinstance(saved.get("doc"), dict):
+            document = saved["doc"]
+        elif isinstance(saved, list) and saved:
+            document = saved[0]
+            if isinstance(document, dict) and isinstance(document.get("doc"), dict):
+                document = document["doc"]
+        else:
+            document = saved
+
         if not isinstance(document, dict) or "owner_id" not in document or "id" not in document:
-            logger.error("Неожиданный ответ docs.save")
+            logger.error("Unexpected docs.save response structure: %s",
+                         list(saved.keys()) if isinstance(saved, dict) else type(saved).__name__)
             return False
+
         attachment = f"doc{document['owner_id']}_{document['id']}"
         if document.get("access_key"):
             attachment += f"_{document['access_key']}"
-        self.send_message(peer_id, caption or "📊 Excel-отчёт готов.", attachment=attachment)
+        message_id = self.send_message(
+            peer_id, caption or "📊 Excel-отчёт готов.", attachment=attachment
+        )
+        if message_id is None:
+            logger.error("Excel was uploaded but VK failed to send the document message")
+            return False
         return True
 
     def _init_longpoll(self, keep_ts: bool = False) -> bool:
